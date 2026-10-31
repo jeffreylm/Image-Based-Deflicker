@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Deflicker Lab</title>
+<style>
+  :root { --bg:#0e0f11; --panel:#16181b; --line:#262a2f; --text:#d8dce1; --dim:#8a9099; --accent:#ff7a45; --ok:#5ad19a; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--text); font:13px/1.4 -apple-system,BlinkMacSystemFont,"Inter",sans-serif; }
+  #app { display:grid; grid-template-columns:1fr 340px; height:100vh; }
+  #stage { display:flex; flex-direction:column; min-width:0; }
+  #view { flex:1; position:relative; display:flex; align-items:center; justify-content:center; overflow:hidden; }
+  canvas { display:block; cursor:grab; }
+  canvas.dragging { cursor:grabbing; }
+  .tag { position:absolute; top:10px; padding:3px 8px; background:rgba(0,0,0,.6); border-radius:4px; font-size:11px; letter-spacing:.08em; text-transform:uppercase; pointer-events:none; }
+  #modes { display:flex; gap:4px; padding:8px 10px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  #transport { display:flex; gap:8px; align-items:center; padding:8px 10px; border-top:1px solid var(--line); }
+  #transport input[type=range] { flex:1; }
+  button, select, input[type=text] { background:#1f2226; color:var(--text); border:1px solid var(--line); border-radius:5px; padding:5px 9px; font:inherit; }
+  button:hover { border-color:#3a4047; }
+  button.on { background:var(--accent); border-color:var(--accent); color:#111; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#111; font-weight:600; }
+  #side { background:var(--panel); border-left:1px solid var(--line); overflow-y:auto; padding:0 14px 20px; }
+  h2 { font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:var(--dim); margin:18px 0 8px; display:flex; justify-content:space-between; align-items:center; }
+  h2 small { text-transform:none; letter-spacing:0; }
+  .row { margin:8px 0; }
+  .row label { display:flex; justify-content:space-between; color:var(--dim); cursor:help; }
+  .row label b { color:var(--text); font-weight:500; font-variant-numeric:tabular-nums; }
+  .row input[type=range] { width:100%; margin:3px 0 0; accent-color:var(--accent); }
+  .row.changed label span { color:var(--accent); }
+  #status { font-size:12px; color:var(--dim); min-height:18px; }
+  #status.busy { color:var(--accent); }
+  table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+  td { padding:3px 0; border-bottom:1px solid var(--line); }
+  td:last-child { text-align:right; }
+  .good { color:var(--ok); }
+  .flex { display:flex; gap:6px; }
+  .flex > * { flex:1; min-width:0; }
+  #joblog { white-space:pre-wrap; font:11px/1.35 ui-monospace,Menlo,monospace; color:var(--dim); max-height:140px; overflow:auto; margin-top:6px; }
+  #loading { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; background:var(--bg); z-index:5; color:var(--dim); }
+  .hint { color:var(--dim); font-size:11px; margin-top:4px; }
+  kbd { background:#24282d; border:1px solid var(--line); border-radius:3px; padding:0 4px; font:10px ui-monospace,Menlo,monospace; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="stage">
+    <div id="modes"></div>
+    <div id="view">
+      <div id="loading">Loading…</div>
+      <canvas id="gl"></canvas>
+      <div class="tag" id="tagL"></div>
+      <div class="tag" id="tagR"></div>
+    </div>
+    <div id="transport">
+      <button id="play" title="Space">▶</button>
+      <button id="prev" title="←">◀︎|</button>
+      <button id="next" title="→">|▶︎</button>
+      <input type="range" id="scrub" min="0" value="0">
+      <span id="fnum" style="min-width:70px;text-align:right;font-variant-numeric:tabular-nums"></span>
+      <select id="speed"><option value="1">1×</option><option value="0.5">½×</option><option value="0.25">¼×</option><option value="0.1">0.1×</option></select>
+      <button id="resetView" title="R / double-click">Fit</button>
+    </div>
+  </div>
+
+  <div id="side">
+    <h2>Shot <small id="shot"></small></h2>
+    <div class="flex"><select id="clipList" title="Shots in the same folder"></select><button id="clipOpen" style="flex:0 0 auto">Open</button></div>
+    <div class="flex" style="margin-top:6px"><button id="clipBrowse">Browse for a shot…</button></div>
+    <div class="hint" id="clipFolder" style="word-break:break-all"></div>
+    <div id="status" style="margin-top:6px"></div>
+
+    <h2>Live <small>shader uniforms · instant</small></h2>
+    <div id="live"></div>
+
+    <h2>Denoise <small>shader uniforms · instant</small></h2>
+    <div id="denoise"></div>
+
+    <h2>Analysis <small>recompute · ~2–5 s</small></h2>
+    <div id="analysis"></div>
+
+    <h2>View</h2>
+    <div id="viewctl"></div>
+    <div class="hint">Hold <kbd>O</kbd> = original · <kbd>1</kbd>–<kbd>7</kbd> modes · <kbd>Space</kbd> play · <kbd>←</kbd><kbd>→</kbd> step · <kbd>C</kbd> channel · <kbd>H</kbd> high-pass · wheel zoom, drag pan (<kbd>Shift</kbd>+drag in Wipe)</div>
+
+    <h2>Measure</h2>
+    <button id="measure" style="width:100%">Measure flicker removed</button>
+    <table id="metrics" style="margin-top:8px"></table>
+    <div class="hint">Beat-frequency energy removed, on local 8×8 tiles of the bright half of the frame.</div>
+
+    <h2>Presets</h2>
+    <div class="flex"><select id="presetList"></select><button id="presetLoad">Load</button></div>
+    <div class="flex" style="margin-top:6px"><input type="text" id="presetName" placeholder="name"><button id="presetSave">Save</button></div>
+    <div class="flex" style="margin-top:6px"><button id="resetAll">Reset to defaults</button><button id="copyJson">Copy JSON</button></div>
+
+    <h2>Render</h2>
+    <div class="flex"><input type="text" id="renderLabel" placeholder="label (e.g. try3)"><button id="render" class="primary">Render shot</button></div>
+    <div class="hint" style="margin-top:8px">Output folder</div>
+    <div class="flex"><input type="text" id="outdir" title="Type or paste a folder path, then press Enter"></div>
+    <div class="flex" style="margin-top:6px"><button id="outdirChoose">Change…</button><button id="outdirReveal">Show in Finder</button></div>
+    <div id="joblog"></div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const LIVE = [
+  ["luma", "Luma strength", 0, 2, 0.01, "How much of the brightness flicker correction is applied."],
+  ["chroma", "Chroma strength", 0, 2, 0.01, "How much of the colour flicker correction (projector colour wheel) is applied."],
+  ["detail", "Detail strength", 0, 2, 0.01, "Evens out the sharp/soft pulse (frames where the camera caught two projected video frames). 0 = off."],
+  ["strength", "Overall strength", 0, 2, 0.01, "Multiplies everything."],
+  ["mask_lo", "Mask start", 0, 0.03, 0.0005, "Flicker energy (log units) below which nothing is corrected. Raise to protect non-projected areas."],
+  ["mask_hi", "Mask full", 0, 0.05, 0.0005, "Flicker energy above which the full correction applies."],
+];
+const DENOISE = [
+  ["dn_chroma", "Colour denoise", 0, 1, 0.01, "Temporal noise reduction of colour grain (this is most of the blue channel's noise). Doesn't soften detail."],
+  ["dn_luma", "Luma denoise", 0, 1, 0.01, "Temporal noise reduction of brightness grain. Stronger = calmer blacks, but slightly softer."],
+  ["dn_radius", "Frames each side", 0, 3, 1, "How many neighbouring frames are averaged on each side. 0 = off."],
+  ["dn_threshold", "Motion protection", 0.005, 0.1, 0.001, "A neighbour pixel only counts if it differs less than this. Lower = safer on moving content, less noise removed."],
+  ["dn_shadows", "Shadows up to", 0.02, 1, 0.01, "Denoise only below this brightness (fades out by 2×). 1 = everywhere."],
+];
+const ANALYSIS = [
+  ["period", "Period (frames)", 0, 12, 1, "Frames per flicker cycle. 0 = auto-detected."],
+  ["periods", "Window (periods)", 1, 4, 1, "How many whole cycles the temporal reference averages. More = steadier reference, but slower content changes get softened."],
+  ["smooth_x", "Smooth X", 0.002, 0.1, 0.001, "Horizontal smoothing of the gain map (fraction of width). Lower = follows projected detail more closely, removes more local flicker; too low = noise."],
+  ["smooth_y", "Smooth Y", 0.0005, 0.02, 0.0005, "Vertical smoothing (fraction of height). Bands are rows, keep it small."],
+  ["chroma_smooth", "Chroma smoothing ×", 0.25, 6, 0.05, "Extra smoothing multiplier for the colour correction. Higher = calmer colour, less blotch risk."],
+  ["robust", "Robust threshold", 0.005, 0.3, 0.005, "How strongly pixels that don't fit the band model (people, parallax) are ignored. Lower = more rejection."],
+  ["clamp", "Clamp", 0.05, 0.6, 0.01, "Maximum correction (log units, 0.3 ≈ ±35%)."],
+  ["passes", "Passes", 1, 3, 1, "Run the analysis again on the corrected result to catch what's left."],
+  ["detail_size", "Detail size (px)", 1, 12, 0.5, "Size of the detail that pulses sharp/soft, in full-res pixels. Bigger = also evens out mid-size ghosting. First change re-reads the clip at full res."],
+  ["detail_coherence", "Detail pulse threshold", 0.1, 0.7, 0.01, "Only correct detail where its change follows the flicker rhythm this strongly (0–1). Higher = only the clearest sharp/soft areas; protects grain in the blacks."],
+  ["detail_smooth", "Detail map smooth", 0.0005, 0.02, 0.0005, "Smoothing of the detail correction map (fraction of width). Lower = more local, too low = grain pumping."],
+];
+const MODES = [["Wipe","wipe"],["Side by side","sbs"],["A / B","ab"],["Temporal diff","diff"],["Gain map","gain"],["Mask","mask"],["Detail gain","detail"]];
+
+let info, params = {}, defaults = {}, gl, prog, U = {}, tex = {}, n = 0;
+let frame = 0, playing = false, lastT = 0, acc = 0, speed = 1;
+let mode = 0, split = 0.5, zoom = 1, pan = [0, 0], amp = 8, holdOrig = false, abOrig = false, autoFlip = false;
+let chan = 0, hp = false;
+const VIEW_KEYS = ["amp", "hp_size", "hp_gain"];
+const CHANNELS = ["RGB", "R", "G", "B", "Luma"];
+let computeSeq = 0, computing = false, pendingCompute = false;
+
+// ---------------------------------------------------------------- UI
+function slider(parent, [key, label, min, max, step, help], onInput, onChange) {
+  const row = document.createElement("div"); row.className = "row"; row.dataset.key = key;
+  row.innerHTML = `<label title="${help}"><span>${label}</span><b></b></label><input type="range" min="${min}" max="${max}" step="${step}">`;
+  const inp = row.querySelector("input"), out = row.querySelector("b");
+  const fmt = v => key === "period" && +v === 0 ? `auto (${info.auto_period})` : (+v).toFixed(step < 1 ? Math.max(0, -Math.floor(Math.log10(step))) : 0);
+  row.set = v => { inp.value = v; out.textContent = fmt(v); row.classList.toggle("changed", Math.abs(v - defaults[key]) > 1e-9); };
+  inp.addEventListener("input", () => { params[key] = +inp.value; row.set(+inp.value); onInput && onInput(); });
+  inp.addEventListener("change", () => onChange && onChange());
+  row.querySelector("label").addEventListener("dblclick", () => { params[key] = defaults[key]; row.set(defaults[key]); onInput && onInput(); onChange && onChange(); });
+  parent.appendChild(row); return row;
+}
+const rows = {};
+function syncRows() { for (const k in rows) rows[k].set(params[k]); }
+function status(msg, busy) { const s = $("#status"); s.textContent = msg; s.className = busy ? "busy" : ""; }
+
+function buildUI() {
+  for (const s of LIVE) rows[s[0]] = slider($("#live"), s, draw, null);
+  for (const s of DENOISE) rows[s[0]] = slider($("#denoise"), s, draw, null);
+  for (const s of ANALYSIS) rows[s[0]] = slider($("#analysis"), s, null, requestCompute);
+  const vc = $("#viewctl");
+  rows.amp = slider(vc, ["amp", "Diff / gain amplify", 1, 40, 1, "Amplification for Temporal diff and Gain map views."], () => { amp = params.amp; draw(); });
+  params.amp = amp; defaults.amp = amp; rows.amp.set(amp);
+
+  const chRow = document.createElement("div"); chRow.className = "flex"; chRow.id = "chans"; chRow.style.margin = "10px 0 4px";
+  CHANNELS.forEach((name, i) => {
+    const b = document.createElement("button"); b.textContent = name; b.title = "C cycles channels";
+    b.onclick = () => setChan(i); chRow.appendChild(b);
+  });
+  vc.appendChild(chRow);
+  const hpRow = document.createElement("label"); hpRow.className = "hint"; hpRow.style.display = "block";
+  hpRow.innerHTML = `<input type="checkbox" id="hp"> High-pass filter <kbd>H</kbd> — show only detail (grey = flat)`; vc.appendChild(hpRow);
+  $("#hp").onchange = e => setHP(e.target.checked);
+  defaults.hp_size = params.hp_size = 2; defaults.hp_gain = params.hp_gain = 4;
+  rows.hp_size = slider(vc, ["hp_size", "High-pass radius (px)", 0.5, 20, 0.5, "Blur radius removed by the high-pass, in full-res pixels. Small = fine texture/grain, large = shapes and edges."], draw);
+  rows.hp_gain = slider(vc, ["hp_gain", "High-pass gain", 1, 20, 0.5, "Contrast of the high-pass view."], draw);
+  rows.hp_size.set(2); rows.hp_gain.set(4);
+  const fl = document.createElement("label"); fl.className = "hint"; fl.style.display = "block";
+  fl.innerHTML = `<input type="checkbox" id="autoflip"> A/B auto-flip every 0.5 s`; vc.appendChild(fl);
+  $("#autoflip").onchange = e => autoFlip = e.target.checked;
+
+  MODES.forEach(([name], i) => {
+    const b = document.createElement("button"); b.textContent = `${i + 1} ${name}`; b.onclick = () => setMode(i); $("#modes").appendChild(b);
+  });
+  const ab = document.createElement("button"); ab.id = "abBtn"; ab.textContent = "Showing: FIXED"; ab.style.marginLeft = "auto";
+  ab.onclick = () => { abOrig = !abOrig; draw(); }; $("#modes").appendChild(ab);
+
+  $("#play").onclick = togglePlay;
+  $("#prev").onclick = () => step(-1);
+  $("#next").onclick = () => step(1);
+  $("#scrub").oninput = e => { frame = +e.target.value; draw(); };
+  $("#speed").onchange = e => speed = +e.target.value;
+  $("#resetView").onclick = resetView;
+  $("#measure").onclick = measure;
+  $("#presetSave").onclick = savePreset;
+  $("#presetLoad").onclick = loadPreset;
+  $("#resetAll").onclick = () => { Object.assign(params, defaults); syncRows(); draw(); requestCompute(); };
+  $("#copyJson").onclick = () => { navigator.clipboard.writeText(JSON.stringify(cleanParams(), null, 2)); status("Settings copied to clipboard"); };
+  $("#render").onclick = render;
+}
+
+function setMode(i) {
+  mode = i;
+  [...$("#modes").children].forEach((b, j) => b.classList.toggle("on", j === i));
+  layout(); draw();
+}
+
+function cleanParams() { const o = {}; for (const k in defaults) if (!VIEW_KEYS.includes(k)) o[k] = params[k]; return o; }
+function setChan(i) { chan = i; [...$("#chans").children].forEach((b, j) => b.classList.toggle("on", j === i)); draw(); }
+function setHP(on) { hp = on; $("#hp").checked = on; draw(); }
+
+// ---------------------------------------------------------------- GL
+const VS = `#version 300 es
+in vec2 p; out vec2 vUV; void main(){ vUV = p * 0.5 + 0.5; gl_Position = vec4(p, 0., 1.); }`;
+const FS = `#version 300 es
+precision highp float; precision highp sampler2DArray;
+uniform sampler2DArray uFrames, uGains; uniform sampler2D uEnergy;
+uniform float uFrame, uPrev, uLuma, uChroma, uDetail, uStrength, uLo, uHi, uSplit, uZoom, uAmp, uSigma;
+uniform vec4 uScale; uniform vec2 uPan, uPx, uTexel; uniform int uMode, uOrig;
+uniform int uChan, uHP; uniform float uHpSigma, uHpGain;
+uniform sampler2D uPos; uniform int uDnR; uniform float uDnLuma, uDnChroma, uDnH, uDnShadow, uN; uniform vec2 uAnaSize;  // view: channel 0 all,1 R,2 G,3 B,4 luma · high-pass
+in vec2 vUV; out vec4 o;
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+
+float maskAt(vec2 t) {
+  float E = texture(uEnergy, t).r * uScale.z;
+  float m = clamp((E - uLo) / max(uHi - uLo, 1e-6), 0., 1.);
+  return m * m * (3. - 2. * m);                       // == deflicker.flicker_mask
+}
+vec3 logGain(vec2 t, float layer) {                   // == deflicker.finalize, RGB order
+  vec3 g = (texture(uGains, vec3(t, layer)).rgb * 255. - 128.) / 127.;
+  float dy = g.r * uScale.x, cb = g.g * uScale.y, cr = g.b * uScale.y;
+  float cg = -(LUMA.b * cb + LUMA.r * cr) / LUMA.g;
+  return (uLuma * dy + uChroma * vec3(cr, cg, cb)) * maskAt(t) * uStrength;
+}
+float detailGain(vec2 t, float layer) {               // log amplitude gain of the detail layer
+  float a = (texture(uGains, vec3(t, layer)).a * 255. - 128.) / 127. * uScale.w;
+  return uDetail * a * maskAt(t) * uStrength;
+}
+vec3 src(vec2 t, float layer) { return texture(uFrames, vec3(t, layer)).rgb; }
+vec3 gblur(vec2 t, float layer, float sig) {          // ~ cv2.GaussianBlur(sig px), 9x9 taps over ±2.5 sigma
+  if (sig < 0.3) return src(t, layer);
+  vec3 acc = vec3(0); float ws = 0.;
+  for (int j = -4; j <= 4; j++) for (int i = -4; i <= 4; i++) {
+    vec2 o = vec2(i, j) * 0.625;                      // in sigmas
+    float w = exp(-0.5 * dot(o, o));
+    acc += w * texture(uFrames, vec3(t + o * sig * uTexel, layer)).rgb; ws += w;
+  }
+  return acc / ws;
+}
+vec3 base(vec2 t, float layer) { return gblur(t, layer, uSigma); }
+vec3 fixd(vec2 t, float layer) {                      // == deflicker.render
+  vec3 s = src(t, layer);
+  float dg = detailGain(t, layer);
+  if (dg != 0.) { vec3 lo = base(t, layer); s = lo + (s - lo) * exp(dg); }
+  return clamp(s * exp(logGain(t, layer)), 0., 1.);
+}
+// high-pass of the fixed image without blurring the (already blurring) fixd():
+// fixed/G = k*s + (1-k)*lo_d, so HP_r(fixed)/G = k*HP_r(s) + (1-k)*(lo_d - blur_sqrt(r²+d²)(s))
+vec3 hpFixd(vec2 t, float layer) {
+  vec3 s = src(t, layer);
+  vec3 h = s - gblur(t, layer, uHpSigma);
+  float k = exp(detailGain(t, layer));
+  if (k != 1.) h = k * h + (1. - k) * (base(t, layer) - gblur(t, layer, sqrt(uHpSigma * uHpSigma + uSigma * uSigma)));
+  return h * exp(logGain(t, layer));
+}
+vec3 denoised(vec2 t, float layer, vec3 c) {         // == deflicker.denoise
+  if (uDnR == 0 || (uDnLuma == 0. && uDnChroma == 0.)) return c;
+  vec2 p0 = texelFetch(uPos, ivec2(int(layer), 0), 0).rg;
+  vec3 acc = c; float ws = 1.;
+  for (int k = -3; k <= 3; k++) {
+    if (k == 0 || abs(k) > uDnR) continue;
+    float l = layer + float(k);
+    if (l < 0. || l > uN - 1.) continue;
+    vec2 pj = texelFetch(uPos, ivec2(int(l), 0), 0).rg;
+    vec3 cj = fixd(t + (pj - p0) / uAnaSize, l);   // neighbour aligned onto this frame
+    vec3 d = cj - c;
+    float w = exp(-dot(d, d) / 3. / (2. * uDnH * uDnH));
+    acc += w * cj; ws += w;
+  }
+  vec3 avg = acc / ws;
+  float yt = dot(c, LUMA), ya = dot(avg, LUMA);
+  float m = 1.;
+  if (uDnShadow < 1.) { float x = clamp((ya - uDnShadow) / uDnShadow, 0., 1.); m = 1. - x * x * (3. - 2. * x); }
+  return clamp(c + m * (uDnLuma * (ya - yt) + uDnChroma * ((avg - ya) - (c - yt))), 0., 1.);
+}
+vec3 pick(vec2 t, float layer, bool orig) {
+  if (orig) return uHP == 1 ? src(t, layer) - gblur(t, layer, uHpSigma) : src(t, layer);
+  vec3 f = fixd(t, layer);
+  vec3 dn = denoised(t, layer, f);
+  // the denoise change is almost all fine grain, so add it straight onto the high-pass
+  return uHP == 1 ? hpFixd(t, layer) + (dn - f) : dn;
+}
+vec3 shown(vec2 t, float layer, bool orig) {          // what image views display
+  vec3 c = pick(t, layer, orig);
+  return uHP == 1 ? 0.5 + c * uHpGain : c;
+}
+
+void main() {
+  vec2 q = vUV; int panel = 0;
+  bool dual = uMode == 1 || uMode == 3;
+  if (dual) { panel = q.x < 0.5 ? 0 : 1; q.x = fract(q.x * 2.); }
+  vec2 uv = (q - 0.5) / uZoom + 0.5 + uPan;
+  if (any(lessThan(uv, vec2(0))) || any(greaterThan(uv, vec2(1)))) { o = vec4(0.04, 0.045, 0.05, 1); return; }
+  vec2 t = vec2(uv.x, 1. - uv.y);
+  bool forceOrig = uOrig == 1;
+  vec3 c;
+  if (uMode == 0) {                                   // wipe
+    c = shown(t, uFrame, forceOrig || q.x < uSplit);
+  } else if (uMode == 1) {                            // side by side
+    c = shown(t, uFrame, forceOrig || panel == 0);
+  } else if (uMode == 2) {                            // A/B
+    c = shown(t, uFrame, forceOrig);
+  } else if (uMode == 3) {                            // temporal diff (colour), amplified
+    bool og = forceOrig || panel == 0;
+    c = abs(pick(t, uFrame, og) - pick(t, uPrev, og)) * uAmp;   // with high-pass on: detail change only
+  } else if (uMode == 4) {                            // applied gain, log, amplified
+    c = 0.5 + logGain(t, uFrame) * uAmp;
+  } else if (uMode == 5) {                            // mask overlay
+    float m = maskAt(t);
+    c = mix(src(t, uFrame) * 0.55, vec3(0.2, 1., 0.55), m * 0.45);
+  } else {                                            // detail gain: brighter = detail lifted (soft frame)
+    c = vec3(0.5 + detailGain(t, uFrame) * uAmp * 0.5);
+  }
+  if (uChan == 4) c = vec3(dot(c, LUMA));
+  else if (uChan > 0) c = vec3(c[uChan - 1]);
+  if (uMode == 0 && abs(q.x - uSplit) < uPx.x * 1.5) c = vec3(1);
+  if (dual && abs(vUV.x - 0.5) < uPx.x) c = vec3(0.1);
+  o = vec4(c, 1);
+}`;
+
+function initGL() {
+  gl = $("#gl").getContext("webgl2", { antialias: false, premultipliedAlpha: false });
+  if (!gl) { $("#loading").textContent = "WebGL2 is not available in this browser."; throw new Error("no webgl2"); }
+  const sh = (type, srcTxt) => { const s = gl.createShader(type); gl.shaderSource(s, srcTxt); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; };
+  prog = gl.createProgram(); gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FS));
+  gl.linkProgram(prog); if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+  const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(prog, "p"); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  for (const name of ["uFrames","uGains","uEnergy","uFrame","uPrev","uLuma","uChroma","uDetail","uStrength","uLo","uHi","uSplit","uZoom","uAmp","uSigma","uScale","uPan","uPx","uTexel","uMode","uOrig","uChan","uHP","uHpSigma","uHpGain","uPos","uDnR","uDnLuma","uDnChroma","uDnH","uDnShadow","uN","uAnaSize"])
+    U[name] = gl.getUniformLocation(prog, name);
+  gl.uniform1i(U.uFrames, 0); gl.uniform1i(U.uGains, 1); gl.uniform1i(U.uEnergy, 2); gl.uniform1i(U.uPos, 3);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+}
+
+function texArray(unit, w, h, depth, internal, format, data) {
+  gl.activeTexture(gl.TEXTURE0 + unit);
+  const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D_ARRAY, t);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, internal, w, h, depth, 0, format, gl.UNSIGNED_BYTE, data);
+  return t;
+}
+
+async function loadFrames() {
+  tex.frames = texArray(0, info.pw, info.ph, n, gl.RGB8, gl.RGB, null);
+  let done = 0; const queue = [...Array(n).keys()];
+  async function worker() {
+    while (queue.length) {
+      const i = queue.shift();
+      const px = new Uint8Array(await (await fetch(`/frame/${i}.rgb`)).arrayBuffer());   // raw RGB, lossless
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex.frames);
+      gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, i, info.pw, info.ph, 1, gl.RGB, gl.UNSIGNED_BYTE, px);
+      $("#loading").textContent = `Loading frames ${++done}/${n}`;
+    }
+  }
+  await Promise.all([...Array(6)].map(worker));
+}
+
+function loadPos() {                                 // camera motion per frame (analysis px), for denoise alignment
+  gl.activeTexture(gl.TEXTURE3);
+  const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG32F, n, 1, 0, gl.RG, gl.FLOAT, new Float32Array(info.pos.flat()));
+}
+
+async function loadGains() {
+  const [g, e] = await Promise.all([fetch("/api/gains").then(r => r.arrayBuffer()), fetch("/api/energy").then(r => r.arrayBuffer())]);
+  if (tex.gains) gl.deleteTexture(tex.gains);
+  tex.gains = texArray(1, info.aw, info.ah, n, gl.RGBA8, gl.RGBA, new Uint8Array(g));
+  gl.activeTexture(gl.TEXTURE2);
+  if (tex.energy) gl.deleteTexture(tex.energy);
+  tex.energy = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex.energy);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, info.aw, info.ah, 0, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array(e));
+}
+
+// ---------------------------------------------------------------- layout & draw
+function layout() {
+  const v = $("#view"), c = $("#gl");
+  const aspect = (info.pw / info.ph) * (mode === 1 || mode === 3 ? 2 : 1);
+  let w = v.clientWidth - 20, h = w / aspect;
+  if (h > v.clientHeight - 20) { h = v.clientHeight - 20; w = h * aspect; }
+  c.style.width = w + "px"; c.style.height = h + "px";
+  const dpr = devicePixelRatio || 1; c.width = Math.round(w * dpr); c.height = Math.round(h * dpr);
+  const r = c.getBoundingClientRect(), vr = v.getBoundingClientRect();
+  const tagL = $("#tagL"), tagR = $("#tagR");
+  const dual = mode === 1 || mode === 3;
+  tagL.style.left = (r.left - vr.left + 10) + "px";
+  tagR.style.left = (r.left - vr.left + (dual ? w / 2 : w) + 10) + "px";
+  tagR.style.transform = dual ? "" : "translateX(calc(-100% - 20px))";
+  draw();
+}
+
+function tags() {
+  const o = holdOrig, L = $("#tagL"), R = $("#tagR");
+  const view = mode <= 3 ? [chan ? CHANNELS[chan] : "", hp ? "high-pass" : ""].filter(Boolean).join(" · ") : (chan ? CHANNELS[chan] : "");
+  const set = (el, txt) => { el.textContent = txt && view ? `${txt} · ${view}` : txt; el.style.display = txt ? "" : "none"; };
+  if (mode === 0) { set(L, "original"); set(R, o ? "original" : "fixed"); }
+  else if (mode === 1) { set(L, "original"); set(R, o ? "original" : "fixed"); }
+  else if (mode === 2) { set(L, o || abOrig ? "original" : "fixed"); set(R, ""); }
+  else if (mode === 3) { set(L, "original · frame diff"); set(R, o ? "original · frame diff" : "fixed · frame diff"); }
+  else if (mode === 4) { set(L, "applied correction"); set(R, ""); }
+  else if (mode === 5) { set(L, "flicker mask"); set(R, ""); }
+  else { set(L, "detail correction · bright = lifted"); set(R, ""); }
+  $("#abBtn").textContent = `Showing: ${abOrig ? "ORIGINAL" : "FIXED"}`;
+  $("#abBtn").style.display = mode === 2 ? "" : "none";
+}
+
+function draw() {
+  if (!gl || !tex.gains) return;
+  const c = $("#gl");
+  gl.viewport(0, 0, c.width, c.height);
+  gl.uniform1f(U.uFrame, frame); gl.uniform1f(U.uPrev, Math.max(0, frame - 1));
+  gl.uniform1f(U.uLuma, params.luma); gl.uniform1f(U.uChroma, params.chroma); gl.uniform1f(U.uStrength, params.strength);
+  gl.uniform1f(U.uDetail, params.detail);
+  gl.uniform1f(U.uSigma, params.detail_size * info.pw / info.w); gl.uniform2f(U.uTexel, 1 / info.pw, 1 / info.ph);
+  gl.uniform1f(U.uLo, params.mask_lo); gl.uniform1f(U.uHi, params.mask_hi);
+  gl.uniform1f(U.uSplit, split); gl.uniform1f(U.uZoom, zoom); gl.uniform1f(U.uAmp, amp);
+  gl.uniform4f(U.uScale, info.scales.y, info.scales.c, info.scales.e, info.scales.d);
+  gl.uniform2f(U.uPan, pan[0], pan[1]);
+  gl.uniform2f(U.uPx, 1 / c.width * (mode === 1 || mode === 3 ? 2 : 1), 1 / c.height);
+  gl.uniform1i(U.uMode, mode); gl.uniform1i(U.uOrig, holdOrig || (mode === 2 && abOrig) ? 1 : 0);
+  gl.uniform1i(U.uChan, chan); gl.uniform1i(U.uHP, hp ? 1 : 0);
+  gl.uniform1i(U.uDnR, params.dn_radius); gl.uniform1f(U.uDnLuma, params.dn_luma); gl.uniform1f(U.uDnChroma, params.dn_chroma);
+  gl.uniform1f(U.uDnH, params.dn_threshold); gl.uniform1f(U.uDnShadow, params.dn_shadows);
+  gl.uniform1f(U.uN, n); gl.uniform2f(U.uAnaSize, info.aw, info.ah);
+  gl.uniform1f(U.uHpSigma, params.hp_size * info.pw / info.w); gl.uniform1f(U.uHpGain, params.hp_gain);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  $("#scrub").value = frame; $("#fnum").textContent = `${frame + 1} / ${n}`;
+  tags();
+}
+
+function tick(t) {
+  if (playing) {
+    acc += (t - lastT) / 1000 * info.fps * speed;
+    if (acc >= 1) { frame = (frame + Math.floor(acc)) % n; acc %= 1; draw(); }
+  }
+  if (autoFlip && mode === 2) {
+    const want = Math.floor(t / 500) % 2 === 1;
+    if (want !== abOrig) { abOrig = want; draw(); }
+  }
+  lastT = t; requestAnimationFrame(tick);
+}
+function togglePlay() { playing = !playing; acc = 0; $("#play").textContent = playing ? "❚❚" : "▶"; }
+function step(dx) { playing = false; $("#play").textContent = "▶"; frame = (frame + dx + n) % n; draw(); }
+function resetView() { zoom = 1; pan = [0, 0]; draw(); }
+
+// zoom / pan / wipe
+function localPos(e) {
+  const r = $("#gl").getBoundingClientRect();
+  let x = (e.clientX - r.left) / r.width, y = 1 - (e.clientY - r.top) / r.height;
+  if (mode === 1 || mode === 3) x = (x * 2) % 1;
+  return [x, y];
+}
+function bindMouse() {
+  const c = $("#gl"); let drag = null;
+  c.addEventListener("wheel", e => {
+    e.preventDefault();
+    const [x, y] = localPos(e), z2 = Math.min(32, Math.max(1, zoom * Math.exp(-e.deltaY * 0.0015)));
+    const ux = (x - 0.5) / zoom + 0.5 + pan[0], uy = (y - 0.5) / zoom + 0.5 + pan[1];
+    pan = [ux - (x - 0.5) / z2 - 0.5, uy - (y - 0.5) / z2 - 0.5]; zoom = z2;
+    if (zoom === 1) pan = [0, 0];
+    draw();
+  }, { passive: false });
+  c.addEventListener("mousedown", e => {
+    const [x] = localPos(e);
+    const nearSplit = mode === 0 && !e.shiftKey;
+    drag = { wipe: nearSplit, x: e.clientX, y: e.clientY, pan: [...pan] };
+    if (drag.wipe) { split = x; draw(); }
+    c.classList.add("dragging");
+  });
+  addEventListener("mousemove", e => {
+    if (!drag) return;
+    if (drag.wipe) { split = Math.min(1, Math.max(0, localPos(e)[0])); }
+    else {
+      const r = c.getBoundingClientRect(), pw = r.width / (mode === 1 || mode === 3 ? 2 : 1);
+      pan = [drag.pan[0] - (e.clientX - drag.x) / pw / zoom, drag.pan[1] + (e.clientY - drag.y) / r.height / zoom];
+    }
+    draw();
+  });
+  addEventListener("mouseup", () => { drag = null; c.classList.remove("dragging"); });
+  c.addEventListener("dblclick", resetView);
+  addEventListener("keydown", e => {
+    if (e.target.tagName === "INPUT" && e.target.type === "text") return;
+    if (e.code === "Space") { e.preventDefault(); togglePlay(); }
+    else if (e.key === "ArrowLeft") step(-1);
+    else if (e.key === "ArrowRight") step(1);
+    else if (e.key >= "1" && e.key <= "7") setMode(+e.key - 1);
+    else if (e.key === "o" || e.key === "O") { if (!holdOrig) { holdOrig = true; draw(); } }
+    else if (e.key === "r" || e.key === "R") resetView();
+    else if (e.key === "c" || e.key === "C") setChan((chan + 1) % CHANNELS.length);
+    else if (e.key === "h" || e.key === "H") setHP(!hp);
+  });
+  addEventListener("keyup", e => { if (e.key === "o" || e.key === "O") { holdOrig = false; draw(); } });
+  addEventListener("resize", layout);
+}
+
+// ---------------------------------------------------------------- server calls
+const post = (url, body) => fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
+  .then(async r => { const j = await r.json(); if (!r.ok) throw new Error(j.error || r.status); return j; });
+
+async function requestCompute() {
+  if (computing) { pendingCompute = true; return; }
+  computing = true; const t0 = performance.now();
+  status("Recomputing analysis…", true);
+  try {
+    const r = await post("/api/compute", cleanParams());
+    info.scales = r.scales; info.version = r.version;
+    await loadGains(); draw();
+    status(`Analysis updated in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+    $("#metrics").innerHTML = "";
+  } catch (e) { status("Compute failed: " + e.message); }
+  computing = false;
+  if (pendingCompute) { pendingCompute = false; requestCompute(); }
+}
+
+async function measure() {
+  status("Measuring…", true);
+  try {
+    const m = await post("/api/metrics", cleanParams());
+    const row = (k, v) => `<tr><td>${k}</td><td class="${v >= 97 ? "good" : ""}">${v.toFixed(1)} %</td></tr>`;
+    $("#metrics").innerHTML = row("Brightness flicker", m.luma) + row("Colour flicker red/green", m.red_green) + row("Colour flicker blue/green", m.blue_green) +
+      (m.detail !== undefined ? row("Sharp/soft pulse", m.detail) : "");
+    status("Measured");
+  } catch (e) { status("Measure failed: " + e.message); }
+}
+
+function fillPresets(list) {
+  $("#presetList").innerHTML = list.length ? list.map(p => `<option>${p}</option>`).join("") : `<option value="">(none saved)</option>`;
+}
+async function savePreset() {
+  const name = $("#presetName").value.trim(); if (!name) { status("Type a preset name first"); return; }
+  const r = await post("/api/preset", { name, params: cleanParams() });
+  fillPresets(r.presets); $("#presetList").value = r.saved; status(`Saved preset “${r.saved}”`);
+}
+async function loadPreset() {
+  const name = $("#presetList").value; if (!name) return;
+  const p = await fetch(`/api/preset/${name}`).then(r => r.json());
+  Object.assign(params, p); syncRows(); draw(); $("#presetName").value = name; $("#renderLabel").value = name;
+  requestCompute(); status(`Loaded preset “${name}”`);
+}
+
+// ---------------------------------------------------------------- shots & output folder
+function fillClips() {
+  const c = info.clips;
+  $("#clipList").innerHTML = c.files.map(f => `<option value="${f}" ${f === c.current ? "selected" : ""}>${f.replace(/\.[^.]+$/, "").split("_").pop()} — ${f}</option>`).join("");
+  $("#clipFolder").textContent = c.folder;
+}
+async function openClip(path) {
+  if (!path) return;
+  $("#loading").style.display = ""; $("#loading").textContent = `Opening ${path.split("/").pop()} … (analysing, a few seconds)`;
+  try { await post("/api/open", { path, params: cleanParams() }); location.reload(); }
+  catch (e) { $("#loading").style.display = "none"; status("Open failed: " + e.message.split("\n").filter(Boolean).pop()); }
+}
+async function choose(kind) {
+  status(kind === "file" ? "Choose a shot in the Finder dialog…" : "Choose a folder in the Finder dialog…", true);
+  const r = await post("/api/choose", { kind });
+  status(r.path ? "" : "Cancelled");
+  return r.path;
+}
+async function setOutdir(path) {
+  if (!path) return;
+  try { const r = await post("/api/outdir", { path }); info.outdir = r.outdir; $("#outdir").value = r.outdir; status(`Renders will go to ${r.outdir}`); }
+  catch (e) { status("Folder failed: " + e.message.split("\n").filter(Boolean).pop()); }
+}
+function bindFiles() {
+  $("#clipOpen").onclick = () => openClip(info.clips.folder + "/" + $("#clipList").value);
+  $("#clipBrowse").onclick = async () => openClip(await choose("file"));
+  $("#outdirChoose").onclick = async () => setOutdir(await choose("folder"));
+  $("#outdirReveal").onclick = () => post("/api/reveal", {});
+  $("#outdir").onkeydown = e => { if (e.key === "Enter") setOutdir($("#outdir").value.trim()); };
+}
+
+async function render() {
+  const label = $("#renderLabel").value.trim();
+  const r = await post("/api/render", { params: cleanParams(), label });
+  if (!r.started) { status("A render is already running"); return; }
+  status("Rendering full quality…", true);
+  const poll = async () => {
+    const j = await fetch("/api/job").then(r => r.json());
+    $("#joblog").textContent = j.log.join("\n"); $("#joblog").scrollTop = 1e9;
+    if (j.state === "running") setTimeout(poll, 700);
+    else status(j.state === "done" ? `Rendered → ${j.out.split("/").pop()}` : "Render failed (see log)");
+  };
+  poll();
+}
+
+// ---------------------------------------------------------------- boot
+(async function boot() {
+  info = await fetch("/api/info").then(r => r.json());
+  n = info.n; defaults = { ...info.defaults }; params = { ...info.params };
+  $("#shot").textContent = info.name.split("_").pop() + ` · ${n}f · ${info.fps}fps`;
+  $("#scrub").max = n - 1;
+  $("#outdir").value = info.outdir;
+  fillClips(); bindFiles();
+  buildUI(); syncRows(); fillPresets(info.presets);
+  initGL(); bindMouse();
+  loadPos();
+  await loadFrames();
+  await loadGains();
+  $("#loading").style.display = "none";
+  setMode(0); setChan(0);
+  status(`Flicker period auto-detected: ${info.auto_period} frames (${info.f0.toFixed(2)} Hz)`);
+  requestAnimationFrame(t => { lastT = t; tick(t); });
+})().catch(e => { $("#loading").textContent = "Error: " + e.message; console.error(e); });
+</script>
+</body>
+</html>
