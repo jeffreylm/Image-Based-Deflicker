@@ -2,6 +2,7 @@
 // A small independent host exercises the plug-in's actual exported entry point.
 #include <cassert>
 #include <cstdarg>
+#include <filesystem>
 #include <iostream>
 #include <map>
 #include <variant>
@@ -26,6 +27,7 @@ int offset = 1;
 bool aborted = false;
 int outstanding = 0;
 int missing_time = -1;
+std::string diagnostics_path;
 std::vector<double> fetched;
 constexpr int width = 12;
 constexpr int height = 4;
@@ -123,8 +125,7 @@ OfxStatus parameter_value_at_time(OfxParamHandle parameter, double time, ...) {
 OfxStatus parameter_value(OfxParamHandle parameter, ...) {
     va_list arguments;
     va_start(arguments, parameter);
-    static char empty[] = "";
-    *va_arg(arguments, char**) = empty;
+    *va_arg(arguments, char**) = diagnostics_path.data();
     va_end(arguments);
     return kOfxStatOK;
 }
@@ -227,6 +228,10 @@ int main() {
     // Bypass must preserve all bits, including signed zero, NaN and alpha.
     view = 1;
     put(handle(in_args), kOfxPropTime, 0, 12.0);
+    assert(exported->mainEntry(kOfxImageEffectActionGetFramesNeeded, effect, handle(in_args), handle(out_args)) == kOfxStatOK);
+    double original_range[2] = {};
+    get_many(handle(out_args), "OfxImageClipPropFrameRange_Source", 2, original_range);
+    assert(original_range[0] == 12 && original_range[1] == 12);
     auto& source = source_frames.at(12).pixels;
     source[0] = -0.0F; source[1] = std::nanf("42"); source[2] = -3; source[3] = 0.25F;
     fetched.clear();
@@ -270,10 +275,50 @@ int main() {
     assert(output_frame.pixels[0] == 10 && output_frame.pixels[8 * 4] == 14 && outstanding == 0);
     const auto fractional = deflicker::frame_plan(-0.5, 1, -2.5, 1.5);
     assert((fractional == std::array<double,3>{-1.5, -0.5, 0.5}));
+    bool invalid_range_rejected = false;
+    try { deflicker::frame_plan(0, 1, 2, 1); }
+    catch (const std::invalid_argument&) { invalid_range_rejected = true; }
+    assert(invalid_range_rejected);
+    assert(exported->mainEntry(kOfxImageEffectActionGetClipPreferences, effect, nullptr, handle(out_args)) == kOfxStatOK);
+    int frame_varying = 0;
+    get(handle(out_args), kOfxImageEffectFrameVarying, 0, &frame_varying);
+    assert(frame_varying == 1);
+    for (const auto* action : {kOfxImageEffectActionGetRegionOfDefinition, kOfxImageEffectActionGetRegionsOfInterest}) {
+        assert(exported->mainEntry(action, effect, handle(in_args), handle(out_args)) == kOfxStatOK);
+        const auto* key = !std::strcmp(action, kOfxImageEffectActionGetRegionOfDefinition)
+                        ? kOfxImageEffectPropRegionOfDefinition : "OfxImageClipPropRoI_Source";
+        double rectangle[4] = {};
+        get_many(handle(out_args), key, 4, rectangle);
+        assert(rectangle[0] == 10 && rectangle[1] == 20 && rectangle[2] == 22 && rectangle[3] == 24);
+    }
+    offset = 1;
+    // Diagnostics must record a complete frame identity record when requested.
+    const auto suffix = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    const auto log_path = std::filesystem::temp_directory_path() / ("ibd-ofx-host-test-" + suffix + ".jsonl");
+    diagnostics_path = log_path.string();
+    assert(exported->mainEntry(kOfxImageEffectActionRender, effect, handle(in_args), nullptr) == kOfxStatOK);
+    {
+        std::ifstream log(log_path);
+        std::string record;
+        assert(std::getline(log, record));
+        assert(record.find("\"requested\":[11,12,13]") != std::string::npos);
+        assert(record.find("\"actual\":[11,12,13]") != std::string::npos);
+        assert(record.find("\"hashes\":[") != std::string::npos);
+    }
+    std::filesystem::remove(log_path);
+    diagnostics_path = (std::filesystem::temp_directory_path() / ("ibd-nonexistent-" + suffix) / "log.jsonl").string();
+    assert(exported->mainEntry(kOfxImageEffectActionRender, effect, handle(in_args), nullptr) == kOfxStatOK);
+    diagnostics_path.clear();
+    // Unsupported image formats fail while releasing images already fetched.
+    put_string(handle(source_frames.at(12).properties), kOfxImageEffectPropPixelDepth, 0, kOfxBitDepthShort);
+    assert(exported->mainEntry(kOfxImageEffectActionRender, effect, handle(in_args), nullptr) == kOfxStatErrImageFormat);
+    assert(outstanding == 0);
+    put_string(handle(source_frames.at(12).properties), kOfxImageEffectPropPixelDepth, 0, kOfxBitDepthFloat);
     assert(exported->mainEntry(kOfxActionDestroyInstance, effect, nullptr, nullptr) == kOfxStatOK);
     assert(outstanding == 0);
     std::cout << "PASS: lifecycle, host temporal capability, frame declarations, nonzero clip range,\n"
                  "clip boundaries, random request order, exact bypass, RGB/RGBA, signed strides,\n"
                  "missing-frame cleanup, cancellation, invalid parameters, single-frame clips,\n"
-                 "large offsets, fractional times and image release.\n";
+                 "large offsets, fractional times, geometry, diagnostic logging, unsupported formats\n"
+                 "and image release.\n";
 }
